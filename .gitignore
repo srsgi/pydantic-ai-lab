@@ -1,0 +1,24 @@
+# Secrets — never commit live keys
+.env
+
+# Python
+.venv/
+__pycache__/
+*.pyc
+*.pyo
+
+# Runtime state (regenerated on every run)
+.agent-memory/
+workspace/
+logs/
+*.log
+*.db
+*.sqlite3
+
+# SearXNG container volume (holds its secret_key + engine data)
+searxng/
+
+# OS / editor noise
+.DS_Store
+.vscode/
+*.swp
