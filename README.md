@@ -63,6 +63,12 @@ uv run phoenix serve --port 6006   # separate terminal, leave running
 uv run python 12_telemetry.py      # run any example, traces appear live
 ```
 
+> Lab stack note: Phoenix is NOT auto-started (profiled cold boot pegs a
+> core for 2-4 min, then idles below 1%). The hub Telemetry tab has
+> Start/Stop buttons that boot it on demand (`nice -n 10`); it takes a few
+> minutes to answer on first start. Spans emitted while it is down are lost
+> (only explicit `12_telemetry.py` runs emit spans, so nothing is missed).
+
 Then open **http://127.0.0.1:6006**: each run shows as
 `invoke_agent → chat → execute_tool → chat` with prompts, tool args,
 token usage, and latency per span.
@@ -70,10 +76,10 @@ token usage, and latency per span.
 ## Unified UI: Pydantic AI Lab hub (one URL)
 
 One dashboard entry — **Pydantic AI Lab** → `http://localhost:7940` —
-with an agent dropdown (Research / Approval / ACP Test), a **Direct** tab
+with an agent dropdown (Research / Research Plan / Research Exec / Research Flow / Approval / ACP Test), a **Direct** tab
 for talking to any CLI harness with no parent model in between
 (`/api/direct/*`, persistent session per backend), plus a Telemetry tab
-(`serve_unified.py`; backends on :7933/:7932/:7941/:6006 load lazily in
+(`serve_unified.py`; backends on :7933/:7934/:7935/:7936/:7932/:7941/:6006 load lazily in
 iframes). The individual backend entries stay in the dashboard for
 start/stop but are unpinned; day-to-day, open only the hub.
 

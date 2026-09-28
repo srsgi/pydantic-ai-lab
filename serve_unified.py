@@ -4,20 +4,136 @@ Run: uv run uvicorn serve_unified:app --host 0.0.0.0 --port 7940
 Open: http://localhost:7940  (single dashboard entry: Pydantic AI Lab)
 
 Dropdown lazy-loads each agent UI in an iframe (same origins, no proxy):
-  Research  -> http://localhost:7933 (Researcher chat, fresh prompts)
-  Approval  -> http://localhost:7932 (HITL approval chat)
-  ACP Test  -> http://localhost:7941 (drive ACP backends one by one)
-Telemetry tab -> http://127.0.0.1:6006 (Phoenix traces, parked when hidden).
+  Research      -> http://localhost:7933 (Researcher chat, fresh prompts)
+  Research Plan -> http://localhost:7934 (agree the workflow, approve it)
+  Research Exec -> http://localhost:7935 (runs the approved workflow)
+  Research Flow -> http://localhost:7936 (orchestrator: plan+exec as sub-agents)
+  Approval      -> http://localhost:7932 (HITL approval chat)
+  ACP Test      -> http://localhost:7941 (drive ACP backends one by one)
+Telemetry tab -> Phoenix (trace collector + viewer, http://127.0.0.1:6006).
+Phoenix is NOT auto-started (its cold boot pegs a core for minutes): the
+Telemetry tab has Start/Stop buttons (/api/telemetry/*) and loads the UI
+only once it answers. Spans emitted while it is down are lost — in this lab
+only explicit 12_telemetry.py runs emit spans, so nothing is missed.
 Backends are started/stopped from the Service Dashboard entries.
 """
 import os
+from contextlib import asynccontextmanager
+from pathlib import Path
 
 BACKENDS = {
     "research": os.getenv("HUB_RESEARCH_URL", "http://localhost:7933"),
+    "researchplan": os.getenv("HUB_RESEARCHPLAN_URL", "http://localhost:7934/?v=3"),
+    "researchexecute": os.getenv("HUB_RESEARCHEXECUTE_URL", "http://localhost:7935/?v=3"),
+    "researchflow": os.getenv("HUB_RESEARCHFLOW_URL", "http://localhost:7936"),
     "approval": os.getenv("HUB_APPROVAL_URL", "http://localhost:7932"),
     "acptest": os.getenv("HUB_ACPTEST_URL", "http://localhost:7941"),
     "telemetry": os.getenv("HUB_TELEMETRY_URL", "http://127.0.0.1:6006"),
 }
+
+# --- On-demand Phoenix -----------------------------------------------------
+# Phoenix is both halves of telemetry: the OpenTelemetry collector backend
+# (OTLP gRPC :4317 + HTTP :6006/v1/traces -> local sqlite) AND the trace
+# viewer UI. Nothing in the lab needs it running: agents keep working with
+# it down (exporters just drop spans), so it boots only on user request.
+_TELEMETRY_PORT = 6006
+_TELEMETRY_LOG = "/tmp/phoenix-6006.log"
+_TELEMETRY_PIDFILE = "/tmp/phoenix-ondemand.pid"
+_LAB_DIR = str(Path(__file__).parent)
+_TELEMETRY_UV = "/home/ubu/.local/bin/uv"
+_telemetry_proc = None  # subprocess.Popen while hub-spawned instance lives
+
+
+def _telemetry_pid() -> int | None:
+    try:
+        pid = int(Path(_TELEMETRY_PIDFILE).read_text().strip())
+    except Exception:
+        return None
+    try:
+        import os as _os
+
+        _os.kill(pid, 0)
+        return pid
+    except Exception:
+        return None
+
+
+def _telemetry_port_open() -> bool:
+    import socket as _sock
+
+    try:
+        with _sock.create_connection(("127.0.0.1", _TELEMETRY_PORT), timeout=2):
+            return True
+    except Exception:
+        return False
+
+
+def _telemetry_state() -> dict:
+    pid = _telemetry_pid()
+    if _telemetry_port_open():
+        return {"state": "running", "pid": pid, "note": "answering on :6006"}
+    if pid is not None:
+        note = "warming up (cold boot takes minutes)"
+        try:
+            lines = Path(_TELEMETRY_LOG).read_text().splitlines()
+            if lines:
+                note = lines[-1][:160]
+        except Exception:
+            pass
+        return {"state": "starting", "pid": pid, "note": note}
+    return {"state": "stopped", "pid": None, "note": "start it to view traces"}
+
+
+def _telemetry_start() -> dict:
+    global _telemetry_proc
+    st = _telemetry_state()
+    if st["state"] in ("running", "starting"):
+        return st
+    import subprocess as _sp
+
+    # Fresh boot log per start so the status tail tracks THIS boot.
+    log = open(_TELEMETRY_LOG, "wb")
+    _telemetry_proc = _sp.Popen(
+        ["nice", "-n", "10", _TELEMETRY_UV, "run", "phoenix", "serve",
+         "--port", str(_TELEMETRY_PORT)],
+        cwd=_LAB_DIR, stdout=log, stderr=_sp.STDOUT, stdin=_sp.DEVNULL,
+        start_new_session=False)
+    Path(_TELEMETRY_PIDFILE).write_text(str(_telemetry_proc.pid))
+    return _telemetry_state()
+
+
+def _telemetry_stop() -> dict:
+    global _telemetry_proc
+    import signal as _sig
+    import time as _time
+
+    pid = _telemetry_pid()
+    if pid is None and _telemetry_port_open():
+        import subprocess as _sp2  # noqa: PLC0415
+
+        # Not ours (e.g. autostarted before the on-demand switch): stop by
+        # pattern. Bracket form never matches our own command line.
+        _sp2.run(["pkill", "-f", "[p]hoenix serve --port 6006"],
+                 capture_output=True)
+        return _telemetry_state()
+    if pid is not None:
+        try:
+            os.kill(pid, _sig.SIGTERM)
+            for _ in range(20):
+                _time.sleep(0.5)
+                if _telemetry_pid() is None or not _telemetry_port_open():
+                    break
+            else:
+                os.kill(pid, _sig.SIGKILL)
+        except Exception:
+            pass
+    try:
+        Path(_TELEMETRY_PIDFILE).unlink(missing_ok=True)
+    except Exception:
+        pass
+    _telemetry_proc = None
+    return _telemetry_state()
+
 
 HUB_HTML = """<!doctype html>
 <html lang="en"><head><meta charset="utf-8"/>
@@ -35,6 +151,13 @@ main{flex:1;position:relative}
 iframe{position:absolute;inset:0;width:100%;height:100%;border:0;display:none;background:#fff}
 iframe.active{display:block}
 .hint{margin-left:auto;font-size:12px;color:#8b93a7}
+#t-bar{display:none;position:absolute;top:0;left:0;right:0;z-index:5;gap:8px;align-items:center;padding:8px 14px;background:#11151d;border-bottom:1px solid #232a38;font-size:13px}
+#t-bar.show{display:flex}
+#t-state{color:#e6e9f0}
+#t-note{color:#8b93a7;font-size:12px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap;max-width:60%}
+#t-bar button{border:1px solid #2a3345;background:#1a2130;color:#cfd6e4;border-radius:8px;padding:6px 14px;cursor:pointer;font-size:13px}
+#t-bar button:disabled{opacity:.4;cursor:default}
+#t-start{border-color:#2563eb !important}
 #v-direct{display:none;position:absolute;inset:0;flex-direction:column;background:#0b0e14}
 #v-direct.active{display:flex}
 #d-log{flex:1;overflow-y:auto;padding:16px;display:flex;flex-direction:column;gap:10px}
@@ -57,6 +180,9 @@ details.steps summary{cursor:pointer;color:#8b93a7}
 <header><h1>Pydantic AI Lab</h1>
 <select id="agent" class="tab active">
 <option value="research">Research</option>
+<option value="researchplan">Research Plan</option>
+<option value="researchexecute">Research Exec</option>
+<option value="researchflow">Research Flow</option>
 <option value="approval">Approval</option>
 <option value="acptest">ACP Test</option>
 </select>
@@ -64,9 +190,13 @@ details.steps summary{cursor:pointer;color:#8b93a7}
 <button class="tab" data-t="telemetry">Telemetry</button>
 <span class="hint">backends managed in Service Dashboard</span></header>
 <main>
-<iframe id="f-research" class="active"></iframe>
-<iframe id="f-approval"></iframe>
-<iframe id="f-acptest"></iframe>
+<iframe id="f-research" allow="clipboard-read; clipboard-write" class="active"></iframe>
+<iframe id="f-researchplan" allow="clipboard-read; clipboard-write"></iframe>
+<iframe id="f-researchexecute" allow="clipboard-read; clipboard-write"></iframe>
+<iframe id="f-researchflow" allow="clipboard-read; clipboard-write"></iframe>
+<iframe id="f-approval" allow="clipboard-read; clipboard-write"></iframe>
+<iframe id="f-acptest" allow="clipboard-read; clipboard-write"></iframe>
+<div id="t-bar"><span id="t-state">Telemetry: …</span><button id="t-start">Start</button><button id="t-stop">Stop</button><span id="t-note"></span></div>
 <iframe id="f-telemetry"></iframe>
 <div id="v-direct">
 <div id="d-log"></div>
@@ -79,8 +209,25 @@ details.steps summary{cursor:pointer;color:#8b93a7}
 </main>
 <script>
 const URLS = __URLS__;
-const loaded = {research: false, approval: false, acptest: false, telemetry: false};
+const loaded = {research: false, researchplan: false, researchexecute: false, researchflow: false, approval: false, acptest: false, telemetry: false};
 let dBackend = null;
+let tTimer = null;
+async function tRefresh(){
+  let s;
+  try{ s = await (await fetch('/api/telemetry/status')).json(); }
+  catch(e){ s = {state:'unknown', note:String(e).slice(0,120)}; }
+  document.getElementById('t-state').textContent =
+    'Telemetry: ' + s.state + (s.pid ? ' (pid ' + s.pid + ')' : '');
+  document.getElementById('t-note').textContent = s.note || '';
+  document.getElementById('t-start').disabled = (s.state === 'running' || s.state === 'starting');
+  document.getElementById('t-stop').disabled = !(s.state === 'running' || s.state === 'starting');
+  const f = document.getElementById('f-telemetry');
+  if(s.state === 'running'){
+    if(!loaded.telemetry){ f.src = URLS.telemetry; loaded.telemetry = true; }
+  } else if(loaded.telemetry){ f.src = 'about:blank'; loaded.telemetry = false; }
+}
+async function tStart(){ await fetch('/api/telemetry/start', {method:'POST'}); tRefresh(); }
+async function tStop(){ await fetch('/api/telemetry/stop', {method:'POST'}); tRefresh(); }
 function showFrame(name){
   document.querySelectorAll('iframe').forEach(f=>f.classList.remove('active'));
   document.getElementById('v-direct').classList.remove('active');
@@ -101,11 +248,27 @@ function markActive(name){
 }
 function show(name){
   markActive(name);
+  try{
+    if(URLS[name]) localStorage.setItem('labHubAgent', name);
+  }catch(e){}
+  const bar = document.getElementById('t-bar');
+  if(name === 'telemetry'){
+    bar.classList.add('show');
+    document.querySelectorAll('iframe').forEach(f=>f.classList.remove('active'));
+    document.getElementById('v-direct').classList.remove('active');
+    document.getElementById('f-telemetry').classList.add('active');
+    tRefresh();
+    if(tTimer) clearInterval(tTimer);
+    tTimer = setInterval(tRefresh, 3000);
+    return;
+  }
+  bar.classList.remove('show');
+  if(tTimer){ clearInterval(tTimer); tTimer = null; }
   showFrame(name);
   // Park the Phoenix SPA when hidden: it polls GraphQL continuously (~30%
   // server CPU idle). Traces persist server-side; chats keep their state.
   const t = document.getElementById('f-telemetry');
-  if(name !== 'telemetry' && loaded.telemetry){ t.src = 'about:blank'; loaded.telemetry = false; }
+  if(loaded.telemetry){ t.src = 'about:blank'; loaded.telemetry = false; }
 }
 async function dInit(){
   const r = await fetch('/api/direct/backends'); const j = await r.json();
@@ -193,8 +356,13 @@ async function dSend(){
 document.querySelector('[data-t="telemetry"]').onclick=()=>show('telemetry');
 document.querySelector('[data-t="direct"]').onclick=()=>show('direct');
 document.getElementById('agent').onchange=(e)=>show(e.target.value);
+document.getElementById('t-start').onclick=()=>tStart();
+document.getElementById('t-stop').onclick=()=>tStop();
 dInit();
-show('research');
+try{
+  const saved = localStorage.getItem('labHubAgent');
+  show(saved && URLS[saved] && saved !== 'telemetry' ? saved : 'research');
+}catch(e){ show('research'); }
 </script></body></html>
 """
 
@@ -306,12 +474,40 @@ async def direct_stream(request):
     return StreamingResponse(gen(), media_type="text/event-stream")
 
 
+async def telemetry_status(request):
+    return JSONResponse(_telemetry_state())
+
+
+async def telemetry_start(request):
+    try:
+        return JSONResponse(_telemetry_start())
+    except Exception as e:  # noqa: BLE001 - surfaced in the tab
+        return JSONResponse({"state": "error", "note": f"{type(e).__name__}: {str(e)[:200]}"})
+
+
+async def telemetry_stop(request):
+    try:
+        return JSONResponse(_telemetry_stop())
+    except Exception as e:  # noqa: BLE001 - surfaced in the tab
+        return JSONResponse({"state": "error", "note": f"{type(e).__name__}: {str(e)[:200]}"})
+
+
 async def _maybe_await(value):
     import inspect
 
     if inspect.isawaitable(value):
         return await value
     return value
+
+
+@asynccontextmanager
+async def _lifespan(app):
+    yield
+    try:
+        if _telemetry_pid() is not None:
+            _telemetry_stop()
+    except Exception:
+        pass
 
 
 app = Starlette(routes=[
@@ -324,4 +520,7 @@ app = Starlette(routes=[
     Route("/api/direct/start", direct_start, methods=["POST"]),
     Route("/api/direct/stream", direct_stream),
     Route("/api/direct/end", direct_end, methods=["POST"]),
-])
+    Route("/api/telemetry/status", telemetry_status),
+    Route("/api/telemetry/start", telemetry_start, methods=["POST"]),
+    Route("/api/telemetry/stop", telemetry_stop, methods=["POST"]),
+], lifespan=_lifespan)
